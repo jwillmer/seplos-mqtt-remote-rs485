@@ -100,7 +100,16 @@ try:
             logger.error("Serial reconnection failed: %s", e)
             time.sleep(10)
 
-        
+    def retry_serial_operation(operation, retries=3, delay=1):
+        for attempt in range(retries):
+            try:
+                return operation()
+            except SerialException as e:
+                logger.error(f"Attempt {attempt + 1} failed with error: {e}")
+                time.sleep(delay)
+        logger.error("All retry attempts failed for serial operation.")
+        return None
+            
     # BMS config
 
     # set min and max cell-voltage as this cannot be read from the BMS
@@ -1039,16 +1048,6 @@ try:
             telemetry_feedback["port_voltage"] = self.telemetry.port_voltage
 
             return telemetry_feedback
-
-        def retry_serial_operation(operation, retries=3, delay=1):
-            for attempt in range(retries):
-                try:
-                    return operation()
-                except SerialException as e:
-                    logger.error(f"Attempt {attempt + 1} failed with error: {e}")
-                    time.sleep(delay)
-            logger.error("All retry attempts failed for serial operation.")
-            return None
     
         def read_serial_data(self):
             """
