@@ -1,7 +1,9 @@
 name: Docker
 on:
+  workflow_dispatch: {}
   push:
-  pull_request:
+    branches:
+      - '*'
   
 jobs:
   docker:
