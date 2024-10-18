@@ -17,10 +17,16 @@ from paho.mqtt import MQTTException
 from ha_auto_discovery import AutoDiscoveryConfig
 
 try:
+    is_exiting = False
     def graceful_exit(signum=None, frame=None):
         """
         handle script exit to disconnect mqtt gracefully and cleanup
         """
+        global is_exiting
+        if is_exiting:
+            return
+        is_exiting = True
+    
         # close mqtt client if connected
         if mqtt_client.is_connected():
             logger.info("Sending offline status to mqtt")
@@ -79,6 +85,22 @@ try:
         # return None if the variable is not found
         return None
 
+
+    def ensure_serial_connection():
+        """
+        Ensure the serial connections are open. Attempt to reconnect if any are disconnected.
+        """
+        global SERIAL_MASTER_INSTANCE, SERIAL_SLAVES_INSTANCE
+        try:
+            if FETCH_MASTER and (SERIAL_MASTER_INSTANCE is None or not SERIAL_MASTER_INSTANCE.isOpen()):
+                SERIAL_MASTER_INSTANCE = serial.Serial(port=MASTER_SERIAL_INTERFACE, baudrate=9600, timeout=0.5)
+            if NUMBER_OF_SLAVES > 0 and (SERIAL_SLAVES_INSTANCE is None or not SERIAL_SLAVES_INSTANCE.isOpen()):
+                SERIAL_SLAVES_INSTANCE = serial.Serial(port=SLAVES_SERIAL_INTERFACE, baudrate=19200, timeout=0.5)
+        except SerialException as e:
+            logger.error("Serial reconnection failed: %s", e)
+            time.sleep(10)
+
+        
     # BMS config
 
     # set min and max cell-voltage as this cannot be read from the BMS
@@ -127,6 +149,26 @@ try:
     ENABLE_HA_DISCOVERY_CONFIG = get_config_value("ENABLE_HA_DISCOVERY_CONFIG", return_type=bool)
     HA_DISCOVERY_PREFIX = get_config_value("HA_DISCOVERY_PREFIX")
 
+    def ensure_mqtt_connection():
+        """
+        Ensure the MQTT client is connected. Attempt to reconnect if not connected.
+        """
+        if not mqtt_client.is_connected():
+            reconnect_mqtt_with_backoff()
+
+    def reconnect_mqtt_with_backoff():
+        retries = 0
+        while not mqtt_client.is_connected():
+            try:
+                mqtt_client.reconnect()
+                logger.info("Reconnected to MQTT successfully")
+                break
+            except MQTTException as e:
+                retries += 1
+                backoff_time = min(60, 2 ** retries)
+                logger.error(f"MQTT reconnection failed: {e}. Retrying in {backoff_time} seconds...")
+                time.sleep(backoff_time)
+  
     def on_ha_online(client, _userdata, message) -> None:
         """
         home assistant online-status handler, (re-)publishes sensor configs whenever ha goes online
@@ -998,6 +1040,16 @@ try:
 
             return telemetry_feedback
 
+        def retry_serial_operation(operation, retries=3, delay=1):
+            for attempt in range(retries):
+                try:
+                    return operation()
+                except SerialException as e:
+                    logger.error(f"Attempt {attempt + 1} failed with error: {e}")
+                    time.sleep(delay)
+            logger.error("All retry attempts failed for serial operation.")
+            return None
+    
         def read_serial_data(self):
             """
             read data for given battery_pack address from serial interface
@@ -1038,11 +1090,19 @@ try:
 
             # loop over responses until a valid frame is received, then decode and return it as json
             while True:
-                # send request command to serial interface
-                serial_instance.write(telemetry_command)
-
+                # send request command to serial interface with retry mechanism
+                write_operation = lambda: serial_instance.write(telemetry_command)
+                if retry_serial_operation(write_operation) is None:
+                    logger.error(f"Pack{self.pack_address}: Failed to write telemetry command after retries.")
+                    return False
+            
                 # set EOL to \r
-                raw_data = serial_instance.read_until(b'\r')
+                read_operation = lambda: serial_instance.read_until(b'\r')
+                raw_data = retry_serial_operation(read_operation)
+                if raw_data is None:
+                    logger.error(f"Pack{self.pack_address}: Failed to read telemetry data after retries.")
+                    return False
+            
                 # pack address only, strip everything except 1 byte hex ascii
                 pack_no_data = raw_data[3 : -77]
                 # use info only, i.e. strip soi / ver / adr / cid1 / cid / length / eoi
@@ -1066,11 +1126,19 @@ try:
 
             # loop over responses until a valid frame is received, then decode and return it as json
             while True:
-                # send request command to serial interface
-                serial_instance.write(telesignalization_command)
-
+                # send request command to serial interface with retry mechanism
+                write_operation = lambda: serial_instance.write(telesignalization_command)
+                if retry_serial_operation(write_operation) is None:
+                    logger.error(f"Pack{self.pack_address}: Failed to write telesignalization command after retries.")
+                    return False
+            
                 # set EOL to \r
-                raw_data = serial_instance.read_until(b'\r')
+                read_operation = lambda: serial_instance.read_until(b'\r')
+                raw_data = retry_serial_operation(read_operation)
+                if raw_data is None:
+                    logger.error(f"Pack{self.pack_address}: Failed to read telesignalization data after retries.")
+                    return False
+            
                 # pack address only, strip everything except 1 byte hex ascii
                 pack_no_data = raw_data[3 : -77]
                 # use info only, i.e. strip soi / ver / adr / cid1 / cid / length / eoi
@@ -1093,6 +1161,18 @@ try:
             else:
                 self.last_status = battery_pack_data
             return battery_pack_data
+
+        def retry_mqtt_publish(topic, payload, retries=3, delay=1):
+            for attempt in range(retries):
+                try:
+                    mqtt_client.publish(topic, payload)
+                    logger.info(f"Published to MQTT topic {topic} successfully.")
+                    return
+                except MQTTException as e:
+                    logger.error(f"Attempt {attempt + 1} to publish to MQTT topic {topic} failed: {e}")
+                    time.sleep(delay)
+            logger.error(f"Failed to publish to MQTT topic {topic} after {retries} attempts.")
+
 
     # connect mqtt client and start the loop
     try:
@@ -1132,6 +1212,10 @@ try:
     i = 0
     while True:
         try:
+            # Ensure connections are active before proceeding
+            ensure_mqtt_connection()
+            ensure_serial_connection()
+        
             current_battery_pack = battery_packs[i]["pack_instance"]
             current_address = battery_packs[i]["address"]
 
@@ -1141,7 +1225,7 @@ try:
             # if battery_pack_data has changed, update mqtt stats payload
             if current_battery_pack_data:
                 logger.info("Pack%s:Sending updated stats to mqtt.", current_address)
-                mqtt_client.publish(f"{MQTT_TOPIC}/pack-{current_address}/sensors", json.dumps({
+                retry_mqtt_publish(f"{MQTT_TOPIC}/pack-{current_address}/sensors", json.dumps({
                     **current_battery_pack_data,
                     "last_update": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 }, indent=4))
@@ -1172,4 +1256,5 @@ except KeyboardInterrupt:
     logger.info("Interrupt received, cleaning up and exiting...")
 
 finally:
-    graceful_exit()
+    if not is_exiting:
+        graceful_exit()
