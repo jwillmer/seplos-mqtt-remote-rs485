@@ -109,6 +109,17 @@ try:
                 time.sleep(delay)
         logger.error("All retry attempts failed for serial operation.")
         return None
+
+    def retry_mqtt_publish(topic, payload, retries=3, delay=1):
+        for attempt in range(retries):
+            try:
+                mqtt_client.publish(topic, payload)
+                logger.info(f"Published to MQTT topic {topic} successfully.")
+                return
+            except MQTTException as e:
+                logger.error(f"Attempt {attempt + 1} to publish to MQTT topic {topic} failed: {e}")
+                time.sleep(delay)
+        logger.error(f"Failed to publish to MQTT topic {topic} after {retries} attempts.")
             
     # BMS config
 
@@ -1160,18 +1171,6 @@ try:
             else:
                 self.last_status = battery_pack_data
             return battery_pack_data
-
-        def retry_mqtt_publish(topic, payload, retries=3, delay=1):
-            for attempt in range(retries):
-                try:
-                    mqtt_client.publish(topic, payload)
-                    logger.info(f"Published to MQTT topic {topic} successfully.")
-                    return
-                except MQTTException as e:
-                    logger.error(f"Attempt {attempt + 1} to publish to MQTT topic {topic} failed: {e}")
-                    time.sleep(delay)
-            logger.error(f"Failed to publish to MQTT topic {topic} after {retries} attempts.")
-
 
     # connect mqtt client and start the loop
     try:
